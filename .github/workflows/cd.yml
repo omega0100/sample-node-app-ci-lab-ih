@@ -1,4 +1,4 @@
-name: CI/CD Node App with SonarQube and Azure VM Deploy
+name: CI/CD Pipeline with SonarQube and Azure VM
 
 on:
   workflow_dispatch:
@@ -11,18 +11,14 @@ permissions:
   id-token: write
 
 jobs:
-  build-test-deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
     environment: dev
 
     steps:
-      # 1. Checkout code
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      # 2. Setup Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -30,22 +26,14 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
-      # 3. Install dependencies
       - name: Install dependencies
         run: npm ci
 
-      # 4. Build
-      - name: Build the application (optional)
-        run: |
-          npm run build 2>/dev/null || echo "No build script found, skipping build step"
-
-      # 5. Run Tests + Coverage
       - name: Run unit tests with coverage and JUnit reports
         env:
           JEST_JUNIT_OUTPUT: coverage/junit.xml
         run: npm run test:ci
 
-      # 6. Publish Test Results
       - name: Publish test results to Checks
         uses: dorny/test-reporter@v1
         if: always()
@@ -63,7 +51,6 @@ jobs:
           path: coverage/
           retention-days: 30
 
-      # 7. SonarQube Scan
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@v6.0.0
         env:
@@ -71,56 +58,31 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
           args: >
-            -Dsonar.projectKey=sample-node-app-saurabh
+            -Dsonar.projectKey=sample-node-app
             -Dsonar.sources=.
             -Dsonar.exclusions=node_modules/**,coverage/**,tests/**,**/*.test.js,**/*.spec.js
             -Dsonar.tests=tests/
             -Dsonar.test.inclusions=**/*.test.js,**/*.spec.js
             -Dsonar.coverage.exclusions=node_modules/**,coverage/**,tests/**,**/*.test.js,**/*.spec.js
 
-      # 8. Create Deployment Package
       - name: Create deployment package
         run: |
-          set -euo pipefail
           STAGING="$GITHUB_WORKSPACE/deployment-package"
           rm -rf "$STAGING"
           mkdir -p "$STAGING"
-
-          [ -d public ] && cp -r public "$STAGING/" || echo "No public/ directory found"
-          [ -d node_modules ] && cp -r node_modules "$STAGING/" || echo "No node_modules/ directory found"
-          [ -f server.js ] && cp server.js "$STAGING/" || echo "No server.js found"
-          cp package.json "$STAGING/"
-          cp package-lock.json "$STAGING/"
-          [ -f README.md ] && cp README.md "$STAGING/" || true
-          [ -f Dockerfile ] && cp Dockerfile "$STAGING/" || echo "No Dockerfile found"
-
-          (cd "$STAGING" && npm pkg delete devDependencies || true)
-
-          TS="$(date +%Y%m%d-%H%M%S)"
-          SHORT_SHA="${GITHUB_SHA::7}"
-          ZIP_NAME="deployment-package-${SHORT_SHA}-${TS}.zip"
-          (cd "$GITHUB_WORKSPACE" && zip -r "$ZIP_NAME" "deployment-package")
+          cp -r public "$STAGING/" || true
+          cp server.js package.json package-lock.json "$STAGING/"
+          [ -f Dockerfile ] && cp Dockerfile "$STAGING/"
+          ZIP_NAME="deployment-$(date +%Y%m%d-%H%M%S).zip"
+          (cd "$GITHUB_WORKSPACE" && zip -r "$ZIP_NAME" deployment-package)
           echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
 
-      - name: Upload deployment package artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: deployment-package-node-${{ github.run_number }}
-          path: ${{ env.ZIP_NAME }}
-          retention-days: 90
-
-      # 9. Azure Login
       - name: Azure login (client secret)
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # 10. Upload package to Blob Storage
       - name: Upload package to Blob
-        if: ${{ success() }}
         uses: azure/cli@v2
         env:
           ZIP_NAME: ${{ env.ZIP_NAME }}
@@ -129,111 +91,10 @@ jobs:
           AZ_STORAGE_KEY: ${{ secrets.AZ_STORAGE_KEY }}
         with:
           inlineScript: |
-            set -euo pipefail
-            az storage container create \
-              --name "$AZ_STORAGE_CONTAINER" \
-              --account-name "$AZ_STORAGE_ACCOUNT" \
-              --account-key "$AZ_STORAGE_KEY" \
-              --only-show-errors 1>/dev/null
-
-            echo "Uploading $ZIP_NAME ..."
             az storage blob upload \
-              --account-name "$AZ_STORAGE_ACCOUNT" \
-              --account-key "$AZ_STORAGE_KEY" \
-              --container-name "$AZ_STORAGE_CONTAINER" \
-              --file "$ZIP_NAME" \
-              --name "$ZIP_NAME" \
-              --overwrite true \
-              --only-show-errors
-
-            SAS=$(az storage blob generate-sas \
-              --account-name "$AZ_STORAGE_ACCOUNT" \
-              --account-key "$AZ_STORAGE_KEY" \
-              --container-name "$AZ_STORAGE_CONTAINER" \
-              --name "$ZIP_NAME" \
-              --permissions r \
-              --expiry "$(date -u -d '+1 hour' '+%Y-%m-%dT%H:%MZ')" \
-              --https-only --full-uri -o tsv)
-
-            echo "::add-mask::$SAS"
-            echo "PACKAGE_SAS_URL=$SAS" >> "$GITHUB_ENV"
-
-      # 11. Create deployment script
-      - name: Create deployment script
-        if: ${{ success() }}
-        run: |
-          cat > deploy.sh << 'EOF'
-          #!/bin/bash
-          set -e
-          APP_DIR="/opt/myapp"
-          APP_NAME="myapp"
-          APP_USER="azureuser"
-          PACKAGE_URL="$1"
-
-          if ! command -v node >/dev/null 2>&1; then
-            curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-            sudo apt-get install -y nodejs
-          fi
-
-          if ! command -v pm2 >/dev/null 2>&1; then
-            sudo npm install -g pm2
-          fi
-
-          if ! command -v unzip >/dev/null 2>&1; then
-            sudo apt-get update && sudo apt-get install -y unzip
-          fi
-
-          sudo mkdir -p "$APP_DIR/releases" "$APP_DIR/current"
-
-          curl -fSL "$PACKAGE_URL" -o /tmp/app.zip
-          RELEASE_DIR="$APP_DIR/releases/$(date +%Y%m%d-%H%M%S)"
-          sudo mkdir -p "$RELEASE_DIR"
-          unzip -o /tmp/app.zip -d "$RELEASE_DIR"
-
-          if [ -d "$RELEASE_DIR/deployment-package" ]; then
-            sudo mv "$RELEASE_DIR/deployment-package"/* "$RELEASE_DIR/" || true
-            sudo rmdir "$RELEASE_DIR/deployment-package" || true
-          fi
-
-          sudo chown -R "$APP_USER:$APP_USER" "$RELEASE_DIR"
-
-          if [ -f "$RELEASE_DIR/package.json" ]; then
-            sudo -u "$APP_USER" bash -c "cd '$RELEASE_DIR' && npm ci --omit=dev"
-          fi
-
-          sudo rm -rf "$APP_DIR/current"
-          sudo ln -sfn "$RELEASE_DIR" "$APP_DIR/current"
-
-          sudo -u "$APP_USER" pm2 stop "$APP_NAME" 2>/dev/null || true
-          sudo -u "$APP_USER" pm2 delete "$APP_NAME" 2>/dev/null || true
-          sudo -u "$APP_USER" pm2 start "$APP_DIR/current/server.js" --name "$APP_NAME"
-
-          sudo -u "$APP_USER" pm2 save
-          rm -f /tmp/app.zip
-          EOF
-
-      # 12. Upload + Run script on VM
-      - name: Deploy on Azure VM
-        if: ${{ success() }}
-        uses: azure/cli@v2
-        env:
-          AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
-          AZURE_VM_NAME: ${{ secrets.AZURE_VM_NAME }}
-          PACKAGE_SAS_URL: ${{ env.PACKAGE_SAS_URL }}
-        with:
-          inlineScript: |
-            az vm run-command invoke \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --name "$AZURE_VM_NAME" \
-              --command-id RunShellScript \
-              --scripts "cat > /tmp/deploy.sh << 'EOF'
-            $(cat deploy.sh)
-            EOF
-            chmod +x /tmp/deploy.sh"
-
-            az vm run-command invoke \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --name "$AZURE_VM_NAME" \
-              --command-id RunShellScript \
-              --scripts "sudo /tmp/deploy.sh '$PACKAGE_SAS_URL'"
-
+              --account-name $AZ_STORAGE_ACCOUNT \
+              --account-key $AZ_STORAGE_KEY \
+              --container-name $AZ_STORAGE_CONTAINER \
+              --file $ZIP_NAME \
+              --name $ZIP_NAME \
+              --overwrite
