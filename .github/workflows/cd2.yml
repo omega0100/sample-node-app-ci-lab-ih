@@ -1,0 +1,100 @@
+name: CI/CD Pipeline with SonarQube and Azure Container Apps
+
+on:
+  workflow_dispatch:   # Manual trigger from GitHub Actions tab (you can also add "push" to trigger on code pushes)
+
+permissions:
+  contents: read
+  actions: read
+  checks: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  build-test-scan-deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      # 1️⃣ Pull the source code from the repository
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2️⃣ Set up Node.js environment with caching enabled
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18.x          # You can switch to 22.x if your project requires it
+          cache: npm                  # Speeds up installs by caching node_modules
+          cache-dependency-path: package-lock.json
+
+      # 3️⃣ Install all project dependencies
+      - name: Install dependencies
+        run: npm ci                   # "ci" ensures a clean, reproducible install
+
+      # 4️⃣ Run unit tests and generate JUnit + coverage reports
+      - name: Run unit tests with coverage
+        env:
+          JEST_JUNIT_OUTPUT: coverage/junit.xml
+        run: npm run test:ci          # Custom test script in package.json
+
+      # 5️⃣ Publish test results to GitHub Checks (visible in the PR UI)
+      - name: Publish test results to Checks
+        uses: dorny/test-reporter@v1
+        if: always()                  # Always run this step even if tests fail
+        with:
+          name: Jest Test Results
+          path: coverage/junit.xml
+          reporter: jest-junit
+          fail-on-error: true         # Fail the workflow if test results contain errors
+
+      # 6️⃣ Upload test results as GitHub artifact for later inspection
+      - name: Upload test results to GitHub
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-node
+          path: coverage/
+          retention-days: 30
+
+      # 7️⃣ Perform static code analysis with SonarQube
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v6.0.0
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}   # Example: http://<VM_IP>:9000
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}         # Token generated from SonarQube UI
+        with:
+          args: >
+            -Dsonar.projectKey=sample-node-app
+            -Dsonar.sources=.
+            -Dsonar.exclusions=node_modules/**,coverage/**,tests/**,**/*.test.js,**/*.spec.js
+            -Dsonar.tests=tests/
+            -Dsonar.test.inclusions=**/*.test.js,**/*.spec.js
+            -Dsonar.coverage.exclusions=node_modules/**,coverage/**,tests/**,**/*.test.js,**/*.spec.js
+
+      # 8️⃣ Authenticate to Azure using a Service Principal
+      - name: Azure Login (Service Principal)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      # 9️⃣ Build Docker image, push to Docker Hub, and deploy to Azure Container Apps
+      - name: Build, push image to Docker Hub and deploy to ACA
+        uses: azure/container-apps-deploy-action@v2
+        with:
+          appSourcePath: ${{ github.workspace }}          # Root of the repo
+          dockerfilePath: ./Dockerfile                    # Path to your Dockerfile
+          registryUrl: docker.io
+          registryUsername: ${{ secrets.DOCKERHUB_USERNAME }}
+          registryPassword: ${{ secrets.DOCKERHUB_TOKEN }}
+
+          # Azure-specific settings
+          resourceGroup: rg-Abdullah-Alotaibi                # Your Azure resource group
+          containerAppName: frontendapp-aca                   # ACA app name
+
+          # Image tagged with commit SHA for traceability
+          imageToBuild: ${{ secrets.DOCKERHUB_USERNAME }}/frontendapp-node:${{ github.sha }}
+
